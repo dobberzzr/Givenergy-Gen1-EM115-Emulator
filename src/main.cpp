@@ -10,6 +10,18 @@
 #include "driver/twai.h"
 #include "freertos/FreeRTOS.h"
 #include "secrets.h"  // WIFI_SSID / WIFI_PASSWORD - see include/secrets.h.example
+// 17th October 2026. Overnight charge stall fixes. The inverter stopped at
+// ~00:22 and sat in standby until restarted; /health then showed 25 CAN
+// fail-safe trips and 25 bad RS485 frames in 52 minutes. Changes:
+//  - WiFi/web/OTA moved to a core-0 task so a stalled HTTP client can no
+//    longer block RS485 replies or the CAN keepalive (networkTask()).
+//  - Fail-safe staged: HR25=0 after 5 s quiet, full+empty only after 20 s.
+//  - BMS warning flags logged, no longer treated as protection.
+//  - CAN bus-off recovery; RX queue 5 -> 32.
+//  - Link goes live only after 0x351 and 0x356 have both arrived.
+//  - Pack voltage and temperatures in FC04 Blocks 1-3 follow CAN.
+//  - HR25 defaults to 0 (was 9000) until the battery is live.
+//  - Every HR20/HR25/flag change logged with a reason; counts in /health.
 // 14th October 2026. DATOUBOSS CAN receiver added - decodes the real
 // Pylontech-LV CAN protocol (confirmed via candump capture the same day,
 // see Giv Battery Emulator/giv-docs/10-pylontech-can-reference.md) and
@@ -241,6 +253,7 @@ uint32_t goodFrameCount = 0;
 uint32_t badCrcCount = 0;
 uint32_t replyCount = 0;
 uint32_t unsupportedCount = 0;
+uint32_t badLengthCount = 0;  // chunks != 8 bytes: usually requests that piled up while loop() was blocked
 
 uint32_t fc03Count = 0;
 uint32_t fc04Count = 0;
@@ -453,7 +466,11 @@ uint16_t holdingRegs[28];
 // Keep inverter charge/discharge disabled while mapping.
 // Use conservative limits for functional tests.
 
-uint16_t experimentHR25 = 9000;
+// 17 Oct 2026: default is 0 (no current) rather than 9000 (90 A). After a
+// reboot the inverter is answered with this value until the CAN link is
+// live, so it must not advertise headroom the battery hasn't confirmed.
+// Bench testing without CAN: set it explicitly via /sethr25.
+uint16_t experimentHR25 = 0;
 
 
 void initialiseHoldingRegisters()
@@ -673,6 +690,12 @@ void handleFC03(
 // FC04 PAYLOAD BUILDERS
 // ============================================================
 
+// Live values for FC04 fields that used to be fixed template bytes. They
+// keep the old template values until the CAN link is live, then track the
+// battery (see applyCanLiveData()).
+uint16_t block2PackVoltageMv = 52000;  // Block 2 offsets 5-8, shown by the inverter as IR80/IR83
+int16_t  bmsTemp_0p1C        = 200;    // Block 1 offsets 22-31, Block 3 offsets 32-35
+
 void buildPresentBlock1(uint8_t *d)
 {
   memset(d, 0, 42);
@@ -688,12 +711,12 @@ void buildPresentBlock1(uint8_t *d)
       serial,
       20);
 
-  // Existing temperature/status test data
+  // Temperatures, signed 0.1 degC (0x00C8 = 20.0 C until CAN is live)
 
   for (int i = 0; i < 5; i++)
   {
-    d[22 + i * 2] = 0x00;
-    d[23 + i * 2] = 0xC8;
+    d[22 + i * 2] = (static_cast<uint16_t>(bmsTemp_0p1C) >> 8) & 0xFF;
+    d[23 + i * 2] = static_cast<uint16_t>(bmsTemp_0p1C) & 0xFF;
   }
 
   d[32] = 0x00;
@@ -771,6 +794,12 @@ void buildPresentBlock2(uint8_t *d)
       templateData,
       sizeof(templateData));
 
+  // Pack voltage, mV - two copies (template 0xCB20 = 52000 mV).
+  d[5] = (block2PackVoltageMv >> 8) & 0xFF;
+  d[6] = block2PackVoltageMv & 0xFF;
+  d[7] = (block2PackVoltageMv >> 8) & 0xFF;
+  d[8] = block2PackVoltageMv & 0xFF;
+
   // Confirmed 4-byte big-endian uint32 capacity fields, units 0.01 Ah.
   writeU32BE(d, 13, block2CalibratedCapacityRaw);
   writeU32BE(d, 17, block2DesignCapacityRaw);
@@ -811,13 +840,14 @@ void buildPresentBlock3(uint8_t *d)
         cellMv[i] & 0xFF;
   }
 
-  // Existing fields retained
+  // Temperature extremes, signed 0.1 degC. The Pylontech set gives one
+  // pack temperature, so both carry it.
 
-  d[32] = 0x00;
-  d[33] = 0xC8;
+  d[32] = (static_cast<uint16_t>(bmsTemp_0p1C) >> 8) & 0xFF;
+  d[33] = static_cast<uint16_t>(bmsTemp_0p1C) & 0xFF;
 
-  d[34] = 0x00;
-  d[35] = 0xC8;
+  d[34] = (static_cast<uint16_t>(bmsTemp_0p1C) >> 8) & 0xFF;
+  d[35] = static_cast<uint16_t>(bmsTemp_0p1C) & 0xFF;
 
   // Min / max cell
 
@@ -883,19 +913,49 @@ static constexpr uint32_t CAN_ID_KEEPALIVE    = 0x305;  // sent BY us, to the ba
 
 static constexpr uint32_t CAN_KEEPALIVE_INTERVAL_MS = 1000;
 
-// A link is "live" once any core frame has been seen; it's treated as gone
-// quiet (fail-safe below kicks in) if none of the core six arrive for this
-// long - comfortably inside the ~30s the real BMS/inverter tolerates before
-// giving up on a silent bus (see the reply-timing note in CLAUDE.md).
+// A link is "live" once both 0x351 (limits) and 0x356 (V/I/T) have been
+// seen; it's treated as gone quiet if none of the core six arrive for a
+// while. The fail-safe is staged (17 Oct 2026):
+//   stage 1, CAN_FAILSAFE_MS of silence: HR25 = 0 only - stop current flow.
+//   stage 2, CAN_FAILSAFE_FULL_MS of silence: also raise HR20 full+empty.
+// Raising full+empty on every short gap was enough to push the Gen 1 into
+// a night-time standby it never left on its own. Both stages are well
+// inside the ~30s the real BMS/inverter tolerates (CLAUDE.md).
 static constexpr uint32_t CAN_FAILSAFE_MS = 5000;
+static constexpr uint32_t CAN_FAILSAFE_FULL_MS = 20000;
+
+// Default TWAI RX queue is 5 frames. A reply on RS485 blocks loop() for
+// ~110 ms (50 ms delay + 61 bytes at 9600 baud) and the battery sends its
+// frames in bursts, so 5 overflowed.
+static constexpr int CAN_RX_QUEUE_LEN = 32;
 
 bool canDriverOk = false;
 bool canLinkEverEstablished = false;
+bool canSeenLimits = false;
+bool canSeenVit = false;
 bool canFailsafeActive = false;
+bool canFailsafeFullActive = false;
 uint32_t canLastCoreFrameMillis = 0;
 uint32_t canLastKeepaliveMillis = 0;
 uint32_t canFramesSeen = 0;
 uint32_t canFailsafeTrips = 0;
+uint32_t canFailsafeFullTrips = 0;
+uint32_t canLongestGapMs = 0;
+uint32_t canBusOffCount = 0;
+uint32_t canRecoveryStarts = 0;
+uint32_t canKeepaliveFailures = 0;
+uint32_t canRxMissed = 0;  // frames the TWAI driver dropped (queue/FIFO overrun)
+
+// Why the inverter was last told to stop - counted per reason so /health
+// can say exactly what happened next time charging stops.
+uint32_t blockBmsProtectionCount = 0;  // 0x359 protection flags set
+uint32_t blockThresholdCount = 0;      // our own OV/UV/OC/UT latches
+uint32_t bmsWarningCount = 0;          // 0x359 warning flags set (logged only)
+uint32_t bmsLimitZeroCount = 0;        // BMS sent a 0 A charge or discharge limit
+uint16_t lastLoggedHR20 = 0;
+uint16_t lastLoggedHR25 = 0xFFFF;
+uint16_t lastLoggedProt = 0;
+uint16_t lastLoggedWarn = 0;
 
 // Decoded live values, kept in the CAN wire's own units (0.1A / 0.1V /
 // 0.1degC counts) - converted to HR/IR scale only in applyCanLiveData().
@@ -952,6 +1012,8 @@ void initCan()
   twai_general_config_t g_config =
       TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
 
+  g_config.rx_queue_len = CAN_RX_QUEUE_LEN;
+
   twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -982,7 +1044,41 @@ void sendCanKeepalive()
   msg.data_length_code = 8;
   memset(msg.data, 0, 8);
 
-  twai_transmit(&msg, pdMS_TO_TICKS(10));
+  if (twai_transmit(&msg, pdMS_TO_TICKS(10)) != ESP_OK)
+    canKeepaliveFailures++;
+}
+
+// Without this, one bus-off (e.g. a burst of noise while the inverter is
+// pushing 40+ A) left the controller silent until the next reboot: no
+// keepalive, so the battery stops talking, so the fail-safe never clears.
+void superviseCanBus()
+{
+  twai_status_info_t status;
+
+  if (twai_get_status_info(&status) != ESP_OK)
+    return;
+
+  canRxMissed = status.rx_missed_count;
+
+  if (status.state == TWAI_STATE_BUS_OFF)
+  {
+    if (twai_initiate_recovery() == ESP_OK)
+    {
+      canBusOffCount++;
+      Serial.printf("CAN: BUS-OFF (tx_err=%lu rx_err=%lu) - recovery started\n",
+                    static_cast<unsigned long>(status.tx_error_counter),
+                    static_cast<unsigned long>(status.rx_error_counter));
+    }
+  }
+  else if (status.state == TWAI_STATE_STOPPED)
+  {
+    // Recovery finished: the driver parks in STOPPED until restarted.
+    if (twai_start() == ESP_OK)
+    {
+      canRecoveryStarts++;
+      Serial.println("CAN: recovered from bus-off - restarted");
+    }
+  }
 }
 
 void decodeCanFrame(const twai_message_t &msg)
@@ -1001,6 +1097,7 @@ void decodeCanFrame(const twai_message_t &msg)
         canChargeCurrLimit_0p1A    = canLe16s(d + 2);
         canDischargeCurrLimit_0p1A = canLe16s(d + 4);
         canDischargeVoltLimit_0p1V = canLe16u(d + 6);
+        canSeenLimits = true;
         isCoreFrame = true;
       }
       break;
@@ -1020,6 +1117,7 @@ void decodeCanFrame(const twai_message_t &msg)
         canPackVoltage_0p01V = canLe16s(d + 0);
         canPackCurrent_0p1A  = canLe16s(d + 2);
         canTemp_0p1C         = canLe16s(d + 4);
+        canSeenVit = true;
         isCoreFrame = true;
       }
       break;
@@ -1071,8 +1169,18 @@ void decodeCanFrame(const twai_message_t &msg)
 
   if (isCoreFrame)
   {
-    canLastCoreFrameMillis = millis();
-    canLinkEverEstablished = true;
+    uint32_t now = millis();
+
+    if (canLinkEverEstablished && now - canLastCoreFrameMillis > canLongestGapMs)
+      canLongestGapMs = now - canLastCoreFrameMillis;
+
+    canLastCoreFrameMillis = now;
+
+    // Live only once voltage/temperature AND limits have arrived. Going
+    // live on the first core frame ran computeHR20FromCan() with V=0 and
+    // T=0, briefly latching under-voltage and charge under-temp.
+    if (canSeenLimits && canSeenVit)
+      canLinkEverEstablished = true;
   }
 }
 
@@ -1128,11 +1236,18 @@ uint8_t computeHR20FromCan()
   if (alarmUnderVoltageLatched)    bits |= (1 << 3);  // Under Voltage / "empty"
   if (alarmChargeUnderTempLatched) bits |= (1 << 7);  // Charge under-temp
 
-  // Defense in depth: if the BMS itself is flagging ANY protection or
-  // warning bit we haven't individually decoded yet, don't silently drop
-  // it - fall back to the conservative "stop charging, limit discharge"
-  // pair until the real 0x359 bit layout is confirmed.
-  if (canProtectionFlags != 0 || canWarningFlags != 0)
+  // Defense in depth: if the BMS itself is flagging ANY protection bit we
+  // haven't individually decoded yet, don't silently drop it - fall back
+  // to the conservative "stop charging, limit discharge" pair until the
+  // real 0x359 bit layout is confirmed.
+  //
+  // 17 Oct 2026: WARNING bits no longer do this. A warning is the BMS
+  // saying "approaching a limit" (e.g. charging at 44 A with cells at
+  // 12-15 C) and it already acts on it through the 0x351 current limits,
+  // which HR25 follows. Treating warnings as protection stopped the
+  // inverter outright and left the Gen 1 in standby overnight. Warnings
+  // are still logged and counted - see logBlockChanges().
+  if (canProtectionFlags != 0)
     bits |= (1 << 2) | (1 << 3);
 
   return bits;
@@ -1156,6 +1271,15 @@ void applyCanLiveData()
 
   // HR24: temperature, whole degC.
   holdingRegs[24] = static_cast<uint16_t>(canTemp_0p1C / 10);
+
+  // FC04 fields that were fixed template values: pack voltage (shown by the
+  // inverter as IR80/IR83, stuck at 52.000 V) and temperatures (stuck at
+  // 20.0 C). CAN voltage is 0.01 V, Block 2 wants mV.
+  int32_t packMv = static_cast<int32_t>(canPackVoltage_0p01V) * 10;
+  if (packMv < 0) packMv = 0;
+  if (packMv > 65535) packMv = 65535;
+  block2PackVoltageMv = static_cast<uint16_t>(packMv);
+  bmsTemp_0p1C = canTemp_0p1C;
 
   // HR25: single current limit, 0.01A/count. Gen 1 can't represent charge
   // and discharge limits separately (decided 2026-10-14, CLAUDE.md) - take
@@ -1222,16 +1346,82 @@ void applyCanLiveData()
 // zero current limit, "full" and "empty" both raised, so the inverter
 // neither charges nor discharges against a battery it can no longer hear.
 
-void applyCanFailsafe()
+void applyCanFailsafe(bool full)
 {
   holdingRegs[25] = 0;
-  holdingRegs[20] |= (1 << 2) | (1 << 3);
+
+  if (full)
+    holdingRegs[20] |= (1 << 2) | (1 << 3);
+}
+
+// Log every change to what the inverter is told (HR20/HR25) and to the
+// BMS's own 0x359 flags, with uptime and the reason, and count each
+// reason. When charging stops, the serial log and /health now say why.
+void logBlockChanges()
+{
+  const uint16_t hr20 = holdingRegs[20];
+  const uint16_t hr25 = holdingRegs[25];
+  const uint32_t t = millis() / 1000;
+
+  if (canProtectionFlags != lastLoggedProt)
+  {
+    if (canProtectionFlags != 0)
+      blockBmsProtectionCount++;
+
+    Serial.printf("[%lus] BMS PROTECTION flags 0x%04X -> 0x%04X\n",
+                  static_cast<unsigned long>(t), lastLoggedProt, canProtectionFlags);
+    lastLoggedProt = canProtectionFlags;
+  }
+
+  if (canWarningFlags != lastLoggedWarn)
+  {
+    if (canWarningFlags != 0)
+      bmsWarningCount++;
+
+    Serial.printf("[%lus] BMS WARNING flags 0x%04X -> 0x%04X (logged only, not blocking)\n",
+                  static_cast<unsigned long>(t), lastLoggedWarn, canWarningFlags);
+    lastLoggedWarn = canWarningFlags;
+  }
+
+  if (hr20 != lastLoggedHR20)
+  {
+    if (lastLoggedHR20 == 0 && canProtectionFlags == 0 && !canFailsafeFullActive)
+      blockThresholdCount++;
+
+    Serial.printf("[%lus] HR20 0x%04X -> 0x%04X%s (V=%.2f I=%.1f T=%.1f prot=0x%04X)\n",
+                  static_cast<unsigned long>(t), lastLoggedHR20, hr20,
+                  canFailsafeFullActive ? " [CAN fail-safe]" : "",
+                  canPackVoltage_0p01V / 100.0, canPackCurrent_0p1A / 10.0,
+                  canTemp_0p1C / 10.0, canProtectionFlags);
+    lastLoggedHR20 = hr20;
+  }
+
+  if (hr25 != lastLoggedHR25)
+  {
+    // Only shout about transitions to/from zero; the BMS adjusts its limit
+    // routinely and logging every step would bury the useful lines.
+    const bool toZero = (hr25 == 0 && lastLoggedHR25 != 0);
+    const bool fromZero = (hr25 != 0 && lastLoggedHR25 == 0);
+
+    if (toZero && !canFailsafeActive)
+      bmsLimitZeroCount++;
+
+    if (toZero || fromZero || lastLoggedHR25 == 0xFFFF)
+      Serial.printf("[%lus] HR25 %u -> %u%s (BMS charge=%.1fA discharge=%.1fA)\n",
+                    static_cast<unsigned long>(t), lastLoggedHR25, hr25,
+                    canFailsafeActive ? " [CAN fail-safe]" : "",
+                    canChargeCurrLimit_0p1A / 10.0, canDischargeCurrLimit_0p1A / 10.0);
+
+    lastLoggedHR25 = hr25;
+  }
 }
 
 void serviceCan()
 {
   if (!canDriverOk)
     return;
+
+  superviseCanBus();
 
   uint32_t now = millis();
 
@@ -1260,12 +1450,18 @@ void serviceCan()
   if (!canLinkEverEstablished)
     return;
 
-  if (now - canLastCoreFrameMillis < CAN_FAILSAFE_MS)
+  // Re-read: frames drained above may have just refreshed it.
+  now = millis();
+  const uint32_t quietMs = now - canLastCoreFrameMillis;
+
+  if (quietMs < CAN_FAILSAFE_MS)
   {
     if (canFailsafeActive)
     {
       canFailsafeActive = false;
-      Serial.println("CAN: link recovered - live data resumed");
+      canFailsafeFullActive = false;
+      Serial.printf("[%lus] CAN: link recovered - live data resumed\n",
+                    static_cast<unsigned long>(now / 1000));
     }
 
     applyCanLiveData();
@@ -1276,11 +1472,24 @@ void serviceCan()
     {
       canFailsafeActive = true;
       canFailsafeTrips++;
-      Serial.println("CAN: link gone quiet - fail-safe applied (HR25=0, HR20 full+empty)");
+      Serial.printf("[%lus] CAN: link quiet %lu ms - fail-safe stage 1 (HR25=0)\n",
+                    static_cast<unsigned long>(now / 1000),
+                    static_cast<unsigned long>(quietMs));
     }
 
-    applyCanFailsafe();
+    if (!canFailsafeFullActive && quietMs >= CAN_FAILSAFE_FULL_MS)
+    {
+      canFailsafeFullActive = true;
+      canFailsafeFullTrips++;
+      Serial.printf("[%lus] CAN: link quiet %lu ms - fail-safe stage 2 (HR25=0, HR20 full+empty)\n",
+                    static_cast<unsigned long>(now / 1000),
+                    static_cast<unsigned long>(quietMs));
+    }
+
+    applyCanFailsafe(canFailsafeFullActive);
   }
+
+  logBlockChanges();
 }
 
 
@@ -1689,7 +1898,7 @@ void handleSetStatus()
 void handleHealth()
 {
   String json;
-  json.reserve(512);
+  json.reserve(1280);
 
   json += "{\"uptime_s\":" + String(millis() / 1000);
   json += ",\"boot_count\":" + String(bootCount);
@@ -1717,6 +1926,27 @@ void handleHealth()
   json += ",\"can_temp_c\":" + String(canTemp_0p1C / 10.0, 1);
   json += ",\"can_last_frame_age_s\":";
   json += canLinkEverEstablished ? String((millis() - canLastCoreFrameMillis) / 1000.0, 1) : String("null");
+
+  // 17 Oct 2026: what the inverter is being told, and why it was last told
+  // to stop. If charging stops, these say which path did it.
+  json += ",\"hr20\":" + String(holdingRegs[20]);
+  json += ",\"hr25\":" + String(holdingRegs[25]);
+  json += ",\"rs485_bad_crc\":" + String(badCrcCount);
+  json += ",\"rs485_bad_length\":" + String(badLengthCount);
+  json += ",\"can_failsafe_full\":" + String(canFailsafeFullActive ? "true" : "false");
+  json += ",\"can_failsafe_full_trips\":" + String(canFailsafeFullTrips);
+  json += ",\"can_longest_gap_s\":" + String(canLongestGapMs / 1000.0, 1);
+  json += ",\"can_bus_off\":" + String(canBusOffCount);
+  json += ",\"can_rx_missed\":" + String(canRxMissed);
+  json += ",\"can_keepalive_fail\":" + String(canKeepaliveFailures);
+  json += ",\"can_prot_flags\":" + String(canProtectionFlags);
+  json += ",\"can_warn_flags\":" + String(canWarningFlags);
+  json += ",\"can_charge_limit_a\":" + String(canChargeCurrLimit_0p1A / 10.0, 1);
+  json += ",\"can_discharge_limit_a\":" + String(canDischargeCurrLimit_0p1A / 10.0, 1);
+  json += ",\"block_bms_protection\":" + String(blockBmsProtectionCount);
+  json += ",\"block_threshold\":" + String(blockThresholdCount);
+  json += ",\"bms_warnings\":" + String(bmsWarningCount);
+  json += ",\"bms_limit_zero\":" + String(bmsLimitZeroCount);
   json += "}";
 
   server.sendHeader("Cache-Control", "no-store");
@@ -2977,7 +3207,8 @@ void startNetworkServices()
       unsigned int progress,
       unsigned int total)
   {
-    // An OTA upload blocks loop() for longer than the watchdog timeout.
+    // An OTA upload blocks the network task for longer than the watchdog
+    // timeout. (RS485/CAN in loop() keep running on the other core.)
     esp_task_wdt_reset();
 
     static unsigned int lastPercent = 999;
@@ -3048,8 +3279,7 @@ void superviseWiFi()
   if (wifiDownSince == 0)
     wifiDownSince = now ? now : 1;
 
-  if (now - wifiDownSince >= WIFI_REBOOT_MS &&
-      rxLen == 0)
+  if (now - wifiDownSince >= WIFI_REBOOT_MS)
   {
     Serial.println(
         "WiFi down for 10 min - restarting board");
@@ -3108,16 +3338,41 @@ void serviceNetwork()
   if (!connected)
     superviseWiFi();
 
-  // IMPORTANT:
-  // network gets serviced only when we're not
-  // actively receiving an RS485 frame.
-
   if (connected &&
-      otaStarted &&
-      rxLen == 0)
+      otaStarted)
   {
     ArduinoOTA.handle();
     server.handleClient();
+  }
+}
+
+
+// 17 Oct 2026: the network runs in its own task on core 0 (where the WiFi
+// stack lives); RS485 and CAN stay in loop() on core 1.
+//
+// Before this, server.handleClient() ran inside loop(). The ESP32
+// WebServer waits up to 5 s (HTTP_MAX_DATA_WAIT) for a client that opens a
+// connection and sends nothing - browsers do exactly that with spare
+// pre-opened sockets while the page is polling /labstatus. Each wait
+// starved RS485 (requests piled into one oversized "frame") and the CAN
+// keepalive (battery went quiet -> fail-safe). /health on 17 Oct showed 25
+// bad RS485 frames and 25 fail-safe trips in 52 minutes.
+//
+// Shared state: the web handlers read the same globals loop() writes, and
+// a few write single fields (HR25, Block 2 values, status words). These are
+// aligned 8/16/32-bit values, so each read or write is atomic; at worst the
+// web page shows a mix of two consecutive updates.
+static constexpr uint32_t NETWORK_TASK_STACK = 8192;
+
+void networkTask(void *)
+{
+  esp_task_wdt_add(NULL);
+
+  for (;;)
+  {
+    esp_task_wdt_reset();
+    serviceNetwork();
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
@@ -3158,6 +3413,7 @@ void processFrame()
         static_cast<unsigned>(rxLen));
 
     unsupportedCount++;
+    badLengthCount++;
 
     return;
   }
@@ -3354,6 +3610,19 @@ void setup()
 
   setupWatchdog();
 
+  // After setupWatchdog(): the task subscribes itself to the watchdog.
+  if (xTaskCreatePinnedToCore(
+          networkTask,
+          "network",
+          NETWORK_TASK_STACK,
+          nullptr,
+          1,
+          nullptr,
+          0) != pdPASS)
+  {
+    Serial.println("NETWORK TASK CREATE FAILED - web/OTA unavailable");
+  }
+
   Serial.println(
       "LISTENING...");
 
@@ -3425,11 +3694,7 @@ void loop()
   serviceCan();
 
 
-  // ----------------------------------------------------------
-  // NETWORK ONLY AFTER RS485
-  // ----------------------------------------------------------
-
-  serviceNetwork();
+  // Network (WiFi/OTA/web) runs in networkTask on core 0 - see there.
 
 
   // ----------------------------------------------------------
@@ -3490,7 +3755,7 @@ void loop()
     }
     else if (canFailsafeActive)
     {
-      Serial.print(" CAN=FAILSAFE(link quiet)");
+      Serial.print(canFailsafeFullActive ? " CAN=FAILSAFE-2(link quiet)" : " CAN=FAILSAFE-1(link quiet)");
     }
     else
     {
@@ -3502,6 +3767,17 @@ void loop()
           canTemp_0p1C / 10.0,
           static_cast<unsigned long>(canFramesSeen));
     }
+
+    Serial.printf(
+        " HR20=0x%04X HR25=%u prot=0x%04X warn=0x%04X trips=%lu/%lu busoff=%lu badlen=%lu",
+        holdingRegs[20],
+        holdingRegs[25],
+        canProtectionFlags,
+        canWarningFlags,
+        static_cast<unsigned long>(canFailsafeTrips),
+        static_cast<unsigned long>(canFailsafeFullTrips),
+        static_cast<unsigned long>(canBusOffCount),
+        static_cast<unsigned long>(badLengthCount));
 
     Serial.println();
   }
