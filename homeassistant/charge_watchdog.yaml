@@ -8,7 +8,7 @@ max_exceeded: silent
 triggers:
   - trigger: numeric_state
     entity_id:
-      - sensor.givtcp_sd2246g724_power_givtcp_battery_power
+      - sensor.energy_battery_givtcp_sd2246g724_power_givtcp_discharge_power_givtcp_sd2246g724_power_givtcp_charge_power_net_power
     above: -50
     below: 50
     for: "00:10:00"
@@ -30,7 +30,7 @@ actions:
       title: Battery not charging
       message: >-
         Cheap rate is on but the battery has been at
-        {{ states('sensor.givtcp_sd2246g724_power_givtcp_battery_power') }} W
+        {{ states('sensor.energy_battery_givtcp_sd2246g724_power_givtcp_discharge_power_givtcp_sd2246g724_power_givtcp_charge_power_net_power') }} W
         for 10 minutes
         (SoC {{ states('sensor.givtcp_em20260001_battery_details_givtcp_em20260001_battery_soc') }}%).
   # Only restart the inverter automatically in the main overnight slot.
@@ -54,7 +54,7 @@ actions:
       - delay: "00:10:00"
       - if:
           - condition: numeric_state
-            entity_id: sensor.givtcp_sd2246g724_power_givtcp_battery_power
+            entity_id: sensor.energy_battery_givtcp_sd2246g724_power_givtcp_discharge_power_givtcp_sd2246g724_power_givtcp_charge_power_net_power
             above: -50
             below: 50
         then:
@@ -63,7 +63,7 @@ actions:
               title: Still not charging after restart
               message: >-
                 Battery power is still
-                {{ states('sensor.givtcp_sd2246g724_power_givtcp_battery_power') }} W.
+                {{ states('sensor.energy_battery_givtcp_sd2246g724_power_givtcp_discharge_power_givtcp_sd2246g724_power_givtcp_charge_power_net_power') }} W.
                 Check the emulator: http://192.168.1.83/health
         else:
           - action: notify.mobile_app_pixel_8
@@ -71,7 +71,7 @@ actions:
               title: Charging resumed
               message: >-
                 Battery now at
-                {{ states('sensor.givtcp_sd2246g724_power_givtcp_battery_power') }} W
+                {{ states('sensor.energy_battery_givtcp_sd2246g724_power_givtcp_discharge_power_givtcp_sd2246g724_power_givtcp_charge_power_net_power') }} W
                 after the restart.
   # Hold the run for 30 minutes so a slow recovery can't trigger a second
   # restart straight away (mode: single ignores triggers while running).
